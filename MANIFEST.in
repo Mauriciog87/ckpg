@@ -1,0 +1,5 @@
+include LICENSE
+include README.md
+include tests/package_smoke.py
+include tests/synthetic_checkpoints.py
+include tests/test_*.py

@@ -1,0 +1,72 @@
+[project]
+name = "ckptguard"
+version = "0.1.0"
+description = "Local checkpoint QA and diff CLI for safetensors and LoRA files."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = [
+    "checkpoint",
+    "lora",
+    "machine-learning",
+    "safetensors",
+    "tensor",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Quality Assurance",
+]
+dependencies = [
+    "jinja2>=3.1.0",
+    "numpy>=1.26.0",
+    "pydantic>=2.7.0",
+    "rich>=13.7.0",
+    "safetensors>=0.4.3",
+    "typer>=0.12.0",
+]
+
+[project.scripts]
+ckpg = "ckptguard.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.2.0",
+    "ruff>=0.6.0",
+]
+
+[build-system]
+requires = ["setuptools>=77.0.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["ckptguard*"]
+
+[tool.setuptools.package-data]
+ckptguard = ["reports/templates/*.j2"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = [
+    ".ckptguard",
+    ".ruff_cache",
+    ".uv-cache",
+    ".venv",
+    "build",
+    "dist",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

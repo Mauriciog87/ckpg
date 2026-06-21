@@ -1,0 +1,11 @@
+.venv/
+.uv-cache/
+.ruff_cache/
+.ckptguard/
+.pytest_cache/
+__pycache__/
+*.egg-info/
+*.pyc
+build/
+dist/
+CKPTGUARD_CONTINUITY.md
