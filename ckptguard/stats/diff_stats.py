@@ -6,6 +6,13 @@ from pathlib import Path
 import numpy as np
 
 from ckptguard.models import DiffReport, DiffSummary, TensorDiff, TensorStats
+from ckptguard.numeric import (
+    NUMERIC_CHUNK_ELEMENTS,
+    chunk_l2_norm,
+    ensure_supported_dtype,
+    is_real_numeric_dtype,
+    rms,
+)
 from ckptguard.readers.safetensors_reader import SafeTensorsFile
 from ckptguard.stats.tensor_stats import build_stats_report
 from ckptguard.storage.cache_db import StatsCache
@@ -20,45 +27,46 @@ def _delta(before: float | None, after: float | None) -> float | None:
     return None
 
 
-def _ratio_delta(before: float | None, after: float | None) -> float | None:
-    if before is None or after is None:
-        return None
-    result = after - before
-    if math.isfinite(result):
-        return result
-    return None
-
-
 def _is_numeric(stats: TensorStats) -> bool:
-    dtype = np.dtype(stats.dtype)
-    return np.issubdtype(dtype, np.number) and not np.issubdtype(dtype, np.complexfloating)
+    return is_real_numeric_dtype(stats.dtype)
 
 
 def _cosine_distance(before: np.ndarray, after: np.ndarray) -> float | None:
     if before.shape != after.shape or before.size == 0:
         return None
-    if np.issubdtype(before.dtype, np.complexfloating) or np.issubdtype(
-        after.dtype,
-        np.complexfloating,
-    ):
-        return None
-    if not (np.issubdtype(before.dtype, np.number) and np.issubdtype(after.dtype, np.number)):
+    ensure_supported_dtype(before.dtype)
+    ensure_supported_dtype(after.dtype)
+    if not (is_real_numeric_dtype(before.dtype) and is_real_numeric_dtype(after.dtype)):
         return None
 
-    left = before.astype(np.float64, copy=False).ravel()
-    right = after.astype(np.float64, copy=False).ravel()
-    finite = np.isfinite(left) & np.isfinite(right)
-    if not bool(finite.any()):
-        return None
+    left = before.reshape(-1)
+    right = after.reshape(-1)
+    dot_product = 0.0
+    left_norm = 0.0
+    right_norm = 0.0
+    finite_count = 0
+    for start in range(0, before.size, NUMERIC_CHUNK_ELEMENTS):
+        stop = min(start + NUMERIC_CHUNK_ELEMENTS, before.size)
+        left_chunk = left[start:stop].astype(np.float64, copy=False)
+        right_chunk = right[start:stop].astype(np.float64, copy=False)
+        finite = np.isfinite(left_chunk) & np.isfinite(right_chunk)
+        if not bool(finite.any()):
+            continue
+        left_finite = left_chunk[finite]
+        right_finite = right_chunk[finite]
+        finite_count += int(left_finite.size)
+        dot_product += float(np.dot(left_finite, right_finite))
+        left_norm = math.hypot(left_norm, chunk_l2_norm(left_finite))
+        right_norm = math.hypot(right_norm, chunk_l2_norm(right_finite))
 
-    left = left[finite]
-    right = right[finite]
-    left_norm = float(np.linalg.norm(left))
-    right_norm = float(np.linalg.norm(right))
+    if finite_count == 0:
+        return None
+    if left_norm == 0.0 and right_norm == 0.0:
+        return 0.0
     if left_norm == 0.0 or right_norm == 0.0:
-        return None
+        return 1.0
 
-    similarity = float(np.dot(left, right) / (left_norm * right_norm))
+    similarity = dot_product / (left_norm * right_norm)
     similarity = max(-1.0, min(1.0, similarity))
     distance = 1.0 - similarity
     if math.isfinite(distance):
@@ -71,7 +79,7 @@ def _score(
     before: TensorStats | None,
     after: TensorStats | None,
     changes: list[str],
-    norm_delta: float | None,
+    relative_rms_change: float | None,
     cosine_distance: float | None,
 ) -> float:
     score = 0.0
@@ -84,11 +92,22 @@ def _score(
     if before is not None and after is not None:
         score += abs(after.nan_count - before.nan_count) * 500.0
         score += abs(after.inf_count - before.inf_count) * 500.0
-    if norm_delta is not None:
-        score += min(abs(norm_delta), 1000.0)
+    if relative_rms_change is not None:
+        score += min(abs(relative_rms_change) * 100.0, 1000.0)
     if cosine_distance is not None:
         score += cosine_distance * 100.0
     return score
+
+
+def _relative_rms_change(before: TensorStats, after: TensorStats) -> float | None:
+    before_rms = rms(before.l2_norm, before.numel)
+    after_rms = rms(after.l2_norm, after.numel)
+    if before_rms is None or after_rms is None:
+        return None
+    if before_rms == 0.0:
+        return 0.0 if after_rms == 0.0 else 1.0
+    result = (after_rms - before_rms) / before_rms
+    return result if math.isfinite(result) else None
 
 
 def _matching_diff(
@@ -112,12 +131,19 @@ def _matching_diff(
 
     norm_delta = _delta(before.l2_norm, after.l2_norm)
     linf_delta = _delta(before.linf_norm, after.linf_norm)
-    zero_ratio_delta = _ratio_delta(before.zero_ratio, after.zero_ratio)
+    zero_ratio_delta = _delta(before.zero_ratio, after.zero_ratio)
     mean_delta = _delta(before.mean, after.mean)
     std_delta = _delta(before.std, after.std)
+    relative_rms_change = _relative_rms_change(before, after)
     cosine_distance = None
 
-    if before.shape == after.shape and _is_numeric(before) and _is_numeric(after):
+    if (
+        before.shape == after.shape
+        and before.dtype == after.dtype
+        and before.sha256 == after.sha256
+    ):
+        cosine_distance = 0.0
+    elif before.shape == after.shape and _is_numeric(before) and _is_numeric(after):
         cosine_distance = _cosine_distance(
             before_file.get_tensor(name),
             after_file.get_tensor(name),
@@ -130,7 +156,7 @@ def _matching_diff(
         before=before,
         after=after,
         changes=changes,
-        score=_score(status, before, after, changes, norm_delta, cosine_distance),
+        score=_score(status, before, after, changes, relative_rms_change, cosine_distance),
         norm_delta=norm_delta,
         linf_delta=linf_delta,
         zero_ratio_delta=zero_ratio_delta,

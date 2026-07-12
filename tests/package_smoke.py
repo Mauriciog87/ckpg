@@ -7,6 +7,7 @@ import tempfile
 from importlib.metadata import distribution
 from pathlib import Path
 
+import ml_dtypes
 import numpy as np
 from safetensors.numpy import save_file
 
@@ -21,6 +22,7 @@ def write_checkpoint(path: Path, value: float) -> None:
             "layer.weight": np.array([value, value + 1.0], dtype=np.float32),
             "layer.lora_A.weight": np.ones((2, 4), dtype=np.float32),
             "layer.lora_B.weight": np.ones((4, 2), dtype=np.float32),
+            "layer.bf16.weight": np.array([value, value + 1.0], dtype=ml_dtypes.bfloat16),
         },
         path,
     )
@@ -43,9 +45,7 @@ def main() -> None:
     if "ckptguard" in scripts:
         raise AssertionError("ckptguard console script should not be declared")
 
-    template = importlib.resources.files("ckptguard").joinpath(
-        "reports/templates/report.html.j2"
-    )
+    template = importlib.resources.files("ckptguard").joinpath("reports/templates/report.html.j2")
     if not template.is_file():
         raise AssertionError("HTML report template is missing from installed package")
 
@@ -63,8 +63,13 @@ def main() -> None:
 
         stats_result = run_command(["ckpg", "stats", str(before), "--json", "--no-cache"])
         stats_payload = json.loads(stats_result.stdout)
-        if stats_payload["summary"]["tensor_count"] != 3:
+        if stats_payload["summary"]["tensor_count"] != 4:
             raise AssertionError("unexpected tensor count in stats JSON")
+        bf16_stats = next(
+            tensor for tensor in stats_payload["tensors"] if tensor["name"] == "layer.bf16.weight"
+        )
+        if bf16_stats["dtype"] != "bfloat16" or bf16_stats["mean"] is None:
+            raise AssertionError("BF16 statistics are unavailable")
 
         run_command(
             [

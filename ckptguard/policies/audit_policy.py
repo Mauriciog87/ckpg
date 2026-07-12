@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from statistics import median
 
 from ckptguard.models import AuditFinding, AuditReport, DiffReport, StatsReport, TensorStats
+from ckptguard.numeric import rms
 
-DEFAULT_FAIL_ON = ["nan", "inf", "norm-spike", "shape-drift"]
+DEFAULT_FAIL_ON = ["nan", "inf", "norm-spike"]
+DEFAULT_BASELINE_FAIL_ON = [*DEFAULT_FAIL_ON, "shape-drift"]
 DEFAULT_NORM_SPIKE_FACTOR = 10.0
 DEFAULT_SUSPICIOUS_ABS_MAX = 1_000_000.0
+DIFFERENTIAL_AUDIT_CATEGORIES = {"dtype-change", "shape-drift"}
 KNOWN_AUDIT_CATEGORIES = [
     "dtype-change",
     "inf",
@@ -55,10 +59,15 @@ def _rank_for_side(tensor: TensorStats, side: str) -> int | None:
 
 def _single_tensor_findings(tensors: list[TensorStats]) -> list[AuditFinding]:
     findings: list[AuditFinding] = []
-    l2_values = sorted(tensor.l2_norm for tensor in tensors if tensor.l2_norm is not None)
-    median_l2 = l2_values[len(l2_values) // 2] if l2_values else None
+    rms_values = [
+        value
+        for tensor in tensors
+        if (value := rms(tensor.l2_norm, tensor.numel)) is not None and value > 0.0
+    ]
+    median_rms = median(rms_values) if len(rms_values) >= 3 else None
 
     for tensor in tensors:
+        tensor_rms = rms(tensor.l2_norm, tensor.numel)
         if tensor.nan_count > 0:
             findings.append(
                 AuditFinding(
@@ -82,19 +91,18 @@ def _single_tensor_findings(tensors: list[TensorStats]) -> list[AuditFinding]:
                 )
             )
         if (
-            median_l2 is not None
-            and median_l2 > 0
-            and tensor.l2_norm is not None
-            and tensor.l2_norm >= median_l2 * DEFAULT_NORM_SPIKE_FACTOR
+            median_rms is not None
+            and tensor_rms is not None
+            and tensor_rms >= median_rms * DEFAULT_NORM_SPIKE_FACTOR
         ):
             findings.append(
                 AuditFinding(
                     category="norm-spike",
                     severity="error",
                     tensor=tensor.name,
-                    message="Tensor L2 norm is much larger than the checkpoint median.",
-                    value=tensor.l2_norm,
-                    threshold=median_l2 * DEFAULT_NORM_SPIKE_FACTOR,
+                    message="Tensor RMS is much larger than the checkpoint median.",
+                    value=tensor_rms,
+                    threshold=median_rms * DEFAULT_NORM_SPIKE_FACTOR,
                 )
             )
         if tensor.linf_norm is not None and tensor.linf_norm > DEFAULT_SUSPICIOUS_ABS_MAX:
@@ -180,18 +188,40 @@ def audit_stats_report(report: StatsReport, fail_on: list[str] | None = None) ->
     findings = [*_single_tensor_findings(report.tensors), *_lora_findings(report.tensors)]
     return AuditReport(
         file=report.file,
+        baseline_file=None,
         findings=findings,
         fail_on=selected_fail_on,
         passed=_passes(findings, selected_fail_on),
     )
 
 
-def audit_diff_report(report: DiffReport, fail_on: list[str] | None = None) -> AuditReport:
-    selected_fail_on = fail_on or []
+def _diff_findings(report: DiffReport) -> list[AuditFinding]:
     findings: list[AuditFinding] = []
 
     for diff in report.tensors:
-        if "shape" in diff.changes:
+        if diff.status == "added":
+            findings.append(
+                AuditFinding(
+                    category="shape-drift",
+                    severity="error",
+                    tensor=diff.name,
+                    message="Tensor was added to the candidate checkpoint.",
+                    value=str(diff.after.shape if diff.after is not None else None),
+                    threshold="absent",
+                )
+            )
+        elif diff.status == "removed":
+            findings.append(
+                AuditFinding(
+                    category="shape-drift",
+                    severity="error",
+                    tensor=diff.name,
+                    message="Tensor was removed from the candidate checkpoint.",
+                    value="absent",
+                    threshold=str(diff.before.shape if diff.before is not None else None),
+                )
+            )
+        elif "shape" in diff.changes:
             findings.append(
                 AuditFinding(
                     category="shape-drift",
@@ -236,25 +266,55 @@ def audit_diff_report(report: DiffReport, fail_on: list[str] | None = None) -> A
                         threshold=0,
                     )
                 )
+            before_rms = rms(diff.before.l2_norm, diff.before.numel)
+            after_rms = rms(diff.after.l2_norm, diff.after.numel)
             if (
-                diff.before.l2_norm is not None
-                and diff.before.l2_norm > 0
-                and diff.after.l2_norm is not None
-                and diff.after.l2_norm >= diff.before.l2_norm * DEFAULT_NORM_SPIKE_FACTOR
+                before_rms is not None
+                and before_rms > 0.0
+                and after_rms is not None
+                and (after_rms >= before_rms * DEFAULT_NORM_SPIKE_FACTOR)
             ):
                 findings.append(
                     AuditFinding(
                         category="norm-spike",
                         severity="error",
                         tensor=diff.name,
-                        message="Tensor L2 norm spiked between checkpoints.",
-                        value=diff.after.l2_norm,
-                        threshold=diff.before.l2_norm * DEFAULT_NORM_SPIKE_FACTOR,
+                        message="Tensor RMS spiked between checkpoints.",
+                        value=after_rms,
+                        threshold=before_rms * DEFAULT_NORM_SPIKE_FACTOR,
                     )
                 )
 
+    return findings
+
+
+def audit_diff_report(report: DiffReport, fail_on: list[str] | None = None) -> AuditReport:
+    selected_fail_on = fail_on or []
+    findings = _diff_findings(report)
+
     return AuditReport(
         file=report.after_file,
+        baseline_file=report.before_file,
+        findings=findings,
+        fail_on=selected_fail_on,
+        passed=_passes(findings, selected_fail_on),
+    )
+
+
+def audit_combined_report(report: DiffReport, fail_on: list[str] | None = None) -> AuditReport:
+    selected_fail_on = fail_on or []
+    candidate_tensors = [diff.after for diff in report.tensors if diff.after is not None]
+    absolute_findings = [
+        *_single_tensor_findings(candidate_tensors),
+        *_lora_findings(candidate_tensors),
+    ]
+    findings_by_key = {(finding.category, finding.tensor): finding for finding in absolute_findings}
+    for finding in _diff_findings(report):
+        findings_by_key[(finding.category, finding.tensor)] = finding
+    findings = list(findings_by_key.values())
+    return AuditReport(
+        file=report.after_file,
+        baseline_file=report.before_file,
         findings=findings,
         fail_on=selected_fail_on,
         passed=_passes(findings, selected_fail_on),

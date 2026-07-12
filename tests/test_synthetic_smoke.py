@@ -23,7 +23,7 @@ def test_stats_json_stdout_with_synthetic_normal_checkpoint(tmp_path: Path):
 
     assert result.exit_code == 0
     payload = json.loads(result.stdout)
-    assert payload["schema_version"] == "1.0"
+    assert payload["schema_version"] == "1.1"
     assert payload["summary"]["tensor_count"] == 4
     assert {tensor["name"] for tensor in payload["tensors"]} >= {
         "embed.weight",
@@ -114,7 +114,8 @@ def test_unknown_fail_on_category_exits_with_usage_error(tmp_path: Path):
     )
 
     assert result.exit_code == 2
-    assert "Unknown --fail-on category" in result.stdout
+    assert result.stdout == ""
+    assert "Unknown --fail-on category" in result.stderr
 
 
 def test_corrupt_safetensors_exits_with_read_error(tmp_path: Path):
@@ -123,8 +124,9 @@ def test_corrupt_safetensors_exits_with_read_error(tmp_path: Path):
     result = runner.invoke(app, ["stats", str(checkpoint), "--no-cache"])
 
     assert result.exit_code == 2
-    assert "Could not read tensors" in result.stdout
-    assert str(checkpoint) in result.stdout
+    assert result.stdout == ""
+    assert "Could not read tensors" in result.stderr
+    assert str(checkpoint) in result.stderr
 
 
 def test_non_safetensors_path_exits_with_supported_format_error(tmp_path: Path):
@@ -134,4 +136,5 @@ def test_non_safetensors_path_exits_with_supported_format_error(tmp_path: Path):
     result = runner.invoke(app, ["stats", str(path), "--no-cache"])
 
     assert result.exit_code == 2
-    assert "Only .safetensors files are supported" in result.stdout
+    assert result.stdout == ""
+    assert "Only .safetensors files are supported" in result.stderr
