@@ -5,7 +5,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.1"
 
 
 def utc_now() -> datetime:
@@ -101,6 +101,7 @@ class AuditReport(CkptGuardModel):
     schema_version: str = SCHEMA_VERSION
     generated_at: datetime = Field(default_factory=utc_now)
     file: FileInfo | None
+    baseline_file: FileInfo | None = None
     findings: list[AuditFinding]
     fail_on: list[str]
     passed: bool

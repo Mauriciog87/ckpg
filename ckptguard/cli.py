@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Annotated
 
@@ -9,13 +10,16 @@ from rich.table import Table
 
 from ckptguard.errors import CkptGuardError
 from ckptguard.policies.audit_policy import (
+    DEFAULT_BASELINE_FAIL_ON,
     DEFAULT_FAIL_ON,
+    DIFFERENTIAL_AUDIT_CATEGORIES,
     KNOWN_AUDIT_CATEGORIES,
-    audit_diff_report,
+    audit_combined_report,
     audit_stats_report,
 )
 from ckptguard.reports.html_report import write_html_report
 from ckptguard.reports.json_report import write_json_report
+from ckptguard.reports.output import validate_output_paths
 from ckptguard.stats.diff_stats import diff_checkpoints
 from ckptguard.stats.tensor_stats import build_stats_report
 from ckptguard.storage.cache_db import StatsCache
@@ -26,6 +30,7 @@ app = typer.Typer(
     pretty_exceptions_enable=False,
 )
 console = Console()
+error_console = Console(stderr=True)
 
 
 def _cache(cache_db: Path | None, no_cache: bool) -> StatsCache | None:
@@ -34,15 +39,21 @@ def _cache(cache_db: Path | None, no_cache: bool) -> StatsCache | None:
     return StatsCache(cache_db)
 
 
-def _fail_on(value: str | None) -> list[str]:
-    if value is None or value.strip() == "":
+def _fail_on(value: str | None, has_baseline: bool) -> list[str]:
+    if value is None:
+        return list(DEFAULT_BASELINE_FAIL_ON if has_baseline else DEFAULT_FAIL_ON)
+    if value.strip() == "":
         return []
-    categories = [item.strip() for item in value.split(",") if item.strip()]
+    categories = list(dict.fromkeys(item.strip() for item in value.split(",") if item.strip()))
     unknown = sorted(set(categories) - set(KNOWN_AUDIT_CATEGORIES))
     if unknown:
         known = ", ".join(KNOWN_AUDIT_CATEGORIES)
         bad = ", ".join(unknown)
         raise CkptGuardError(f"Unknown --fail-on category: {bad}. Known categories: {known}")
+    unavailable = sorted(set(categories) & DIFFERENTIAL_AUDIT_CATEGORIES)
+    if unavailable and not has_baseline:
+        names = ", ".join(unavailable)
+        raise CkptGuardError(f"--fail-on category {names} requires --baseline")
     return categories
 
 
@@ -50,17 +61,26 @@ def _run(action) -> None:
     try:
         action()
     except CkptGuardError as exc:
-        console.print(f"[red]Error:[/red] {exc}", soft_wrap=True)
+        error_console.print(f"[red]Error:[/red] {exc}", soft_wrap=True)
         raise typer.Exit(2) from exc
 
 
-def _write_json_if_requested(report, path: Path | None) -> None:
+def _write_json_if_requested(
+    report,
+    path: Path | None,
+    protected_paths: Iterable[Path | str] = (),
+) -> None:
     if path is not None:
-        write_json_report(report, path)
+        write_json_report(report, path, protected_paths=protected_paths)
 
 
-def _emit_json_if_requested(report, path: Path | None, json_stdout: bool) -> bool:
-    _write_json_if_requested(report, path)
+def _emit_json_if_requested(
+    report,
+    path: Path | None,
+    json_stdout: bool,
+    protected_paths: Iterable[Path | str] = (),
+) -> bool:
+    _write_json_if_requested(report, path, protected_paths=protected_paths)
     if json_stdout:
         typer.echo(report.model_dump_json(indent=2))
     return json_stdout
@@ -161,8 +181,14 @@ def stats(
     ] = None,
 ) -> None:
     def action() -> None:
+        validate_output_paths([json_output], [file])
         report = build_stats_report(file, cache=_cache(cache_db, no_cache), use_cache=not no_cache)
-        if not _emit_json_if_requested(report, json_output, json_stdout):
+        if not _emit_json_if_requested(
+            report,
+            json_output,
+            json_stdout,
+            protected_paths=[file],
+        ):
             console.print(_stats_table(report))
 
     _run(action)
@@ -191,13 +217,20 @@ def diff(
     ] = None,
 ) -> None:
     def action() -> None:
+        protected_paths = [before, after]
+        validate_output_paths([json_output], protected_paths)
         report = diff_checkpoints(
             before,
             after,
             cache=_cache(cache_db, no_cache),
             use_cache=not no_cache,
         )
-        if not _emit_json_if_requested(report, json_output, json_stdout):
+        if not _emit_json_if_requested(
+            report,
+            json_output,
+            json_stdout,
+            protected_paths=protected_paths,
+        ):
             console.print(_diff_table(report, top))
 
     _run(action)
@@ -218,6 +251,10 @@ def audit(
         str | None,
         typer.Option("--fail-on", help="Comma-separated finding categories that should fail."),
     ] = None,
+    baseline: Annotated[
+        Path | None,
+        typer.Option("--baseline", help="Baseline .safetensors file for differential checks."),
+    ] = None,
     no_cache: Annotated[
         bool,
         typer.Option("--no-cache", help="Disable SQLite stats cache."),
@@ -228,13 +265,31 @@ def audit(
     ] = None,
 ) -> None:
     def action() -> None:
-        stats_report = build_stats_report(
-            file,
-            cache=_cache(cache_db, no_cache),
-            use_cache=not no_cache,
-        )
-        report = audit_stats_report(stats_report, fail_on=_fail_on(fail_on))
-        if not _emit_json_if_requested(report, json_output, json_stdout):
+        protected_paths = [file, *([baseline] if baseline is not None else [])]
+        validate_output_paths([json_output], protected_paths)
+        selected_fail_on = _fail_on(fail_on, has_baseline=baseline is not None)
+        cache = _cache(cache_db, no_cache)
+        if baseline is None:
+            stats_report = build_stats_report(
+                file,
+                cache=cache,
+                use_cache=not no_cache,
+            )
+            report = audit_stats_report(stats_report, fail_on=selected_fail_on)
+        else:
+            diff_report = diff_checkpoints(
+                baseline,
+                file,
+                cache=cache,
+                use_cache=not no_cache,
+            )
+            report = audit_combined_report(diff_report, fail_on=selected_fail_on)
+        if not _emit_json_if_requested(
+            report,
+            json_output,
+            json_stdout,
+            protected_paths=protected_paths,
+        ):
             console.print(_audit_table(report))
         if not report.passed:
             raise typer.Exit(1)
@@ -267,12 +322,24 @@ def report(
 ) -> None:
     def action() -> None:
         if not html:
-            raise CkptGuardError("Only --html reports are supported in v1.")
+            raise CkptGuardError("Only --html reports are supported.")
+        protected_paths = [before, after]
+        validate_output_paths([output, json_output], protected_paths)
         cache = _cache(cache_db, no_cache)
         diff_report = diff_checkpoints(before, after, cache=cache, use_cache=not no_cache)
-        audit_report = audit_diff_report(diff_report, fail_on=[])
-        write_html_report(diff_report, audit_report, output, top=top)
-        _write_json_if_requested(diff_report, json_output)
+        audit_report = audit_combined_report(diff_report, fail_on=[])
+        write_html_report(
+            diff_report,
+            audit_report,
+            output,
+            top=top,
+            protected_paths=[*protected_paths, *([json_output] if json_output is not None else [])],
+        )
+        _write_json_if_requested(
+            diff_report,
+            json_output,
+            protected_paths=[*protected_paths, output],
+        )
         console.print(f"Wrote HTML report to {output}")
 
     _run(action)
@@ -282,9 +349,13 @@ def report(
 def ci(
     file: Annotated[Path, typer.Argument(help="Path to a .safetensors file.")],
     fail_on: Annotated[
-        str,
+        str | None,
         typer.Option("--fail-on", help="Comma-separated finding categories that should fail."),
-    ] = ",".join(DEFAULT_FAIL_ON),
+    ] = None,
+    baseline: Annotated[
+        Path | None,
+        typer.Option("--baseline", help="Baseline .safetensors file for differential checks."),
+    ] = None,
     json_output: Annotated[
         Path | None,
         typer.Option("--json-output", help="Write JSON report to this path."),
@@ -303,13 +374,31 @@ def ci(
     ] = None,
 ) -> None:
     def action() -> None:
-        stats_report = build_stats_report(
-            file,
-            cache=_cache(cache_db, no_cache),
-            use_cache=not no_cache,
+        protected_paths = [file, *([baseline] if baseline is not None else [])]
+        validate_output_paths([json_output], protected_paths)
+        selected_fail_on = _fail_on(fail_on, has_baseline=baseline is not None)
+        cache = _cache(cache_db, no_cache)
+        if baseline is None:
+            stats_report = build_stats_report(
+                file,
+                cache=cache,
+                use_cache=not no_cache,
+            )
+            report = audit_stats_report(stats_report, fail_on=selected_fail_on)
+        else:
+            diff_report = diff_checkpoints(
+                baseline,
+                file,
+                cache=cache,
+                use_cache=not no_cache,
+            )
+            report = audit_combined_report(diff_report, fail_on=selected_fail_on)
+        emitted_json = _emit_json_if_requested(
+            report,
+            json_output,
+            json_stdout,
+            protected_paths=protected_paths,
         )
-        report = audit_stats_report(stats_report, fail_on=_fail_on(fail_on))
-        emitted_json = _emit_json_if_requested(report, json_output, json_stdout)
         if report.passed:
             if not emitted_json:
                 console.print("ckpg CI checks passed")

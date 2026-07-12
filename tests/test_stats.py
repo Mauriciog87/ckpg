@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from ckptguard.readers.safetensors_reader import SafeTensorsFile
 from ckptguard.stats.tensor_stats import build_stats_report
@@ -56,3 +57,17 @@ def test_stats_report_uses_json_safe_nulls_for_nonfinite_values(checkpoint_facto
     assert tensor.mean is None
     assert "NaN" not in json_payload
     assert "Infinity" not in json_payload
+
+
+def test_chunked_stats_match_numpy_for_large_tensor(checkpoint_factory):
+    values = np.linspace(-100.0, 250.0, 1_048_583, dtype=np.float32)
+    checkpoint = checkpoint_factory("large.safetensors", {"large": values})
+
+    tensor = build_stats_report(checkpoint, use_cache=False).tensors[0]
+    reference = values.astype(np.float64)
+
+    assert tensor.min == pytest.approx(float(reference.min()))
+    assert tensor.max == pytest.approx(float(reference.max()))
+    assert tensor.mean == pytest.approx(float(reference.mean()), rel=1e-12)
+    assert tensor.std == pytest.approx(float(reference.std()), rel=1e-12)
+    assert tensor.l2_norm == pytest.approx(float(np.linalg.norm(reference)), rel=1e-12)
